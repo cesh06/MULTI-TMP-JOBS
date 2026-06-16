@@ -34,7 +34,7 @@ async def safe_click(page, selectors, timeout=8000):
         try:
             await page.wait_for_selector(selector, state="visible", timeout=timeout)
             await page.click(selector, force=True)
-            await asyncio.sleep(random.uniform(0.5, 1.0))  # small human-like delay
+            await asyncio.sleep(random.uniform(0.5, 1.0))
             return True
         except PlaywrightTimeout:
             continue
@@ -48,6 +48,18 @@ async def is_logged_in(page_or_frame):
         return any(phrase in text for phrase in phrases)
     except:
         return False
+
+async def close_any_popup(main):
+    for popup_selectors in [
+        ["text=Gufunga", "button:has-text('Gufunga')"],                              # Type 1: Announcement modal (Itangazo)
+        ["button:has-text('X')", ".close", "[aria-label='Close']", ".modal-close"]  # Type 2: Generic popup
+    ]:
+        closed = await safe_click(main, popup_selectors, timeout=3000)
+        if closed:
+            print("🔒 Popup closed.")
+            break
+    else:
+        print("ℹ️ No popup detected, proceeding.")
 
 async def run_bot_for_user(page, username, password, target_tasks):
     try:
@@ -67,7 +79,7 @@ async def run_bot_for_user(page, username, password, target_tasks):
         print(f"👆 Login submitted for {username}.")
 
         print("⏳ Waiting for successful login...")
-        await asyncio.sleep(10)  # reduced
+        await asyncio.sleep(10)
         if not await is_logged_in(main):
             await asyncio.sleep(5)
             if not await is_logged_in(main):
@@ -77,8 +89,8 @@ async def run_bot_for_user(page, username, password, target_tasks):
 
         print("✅ Login successful!")
 
-        # Close any post-login popup
-        await safe_click(main, ["button:has-text('X')", ".close", "[aria-label='Close']", ".modal-close"], timeout=3000)
+        # Close any post-login popup (checks both known types)
+        await close_any_popup(main)
 
         print("🧭 Clicking 'Inshingano' nav item...")
         nav_clicked = await safe_click(main, ["text=Inshingano", ".bottom-nav > a:nth-child(2)"], timeout=15000)
@@ -135,10 +147,9 @@ async def run_bot_for_user(page, username, password, target_tasks):
                 print("❌ Could not find submit button. Skipping task.")
                 continue
 
-            # Wait for 100% – fewer & shorter attempts
             print("⏳ Waiting for 100%...")
             success_100 = False
-            for attempt in range(5):  # reduced from 8
+            for attempt in range(5):
                 try:
                     await main.wait_for_function("() => document.body.innerText.includes('100%')", timeout=25000)
                     success_100 = True
@@ -206,7 +217,7 @@ async def main():
             page = await context.new_page()
             await run_bot_for_user(page, username, password, target_tasks)
             await context.close()
-            await asyncio.sleep(6)  # shorter cooldown
+            await asyncio.sleep(6)
 
         await browser.close()
 
