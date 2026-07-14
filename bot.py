@@ -3,12 +3,14 @@ import os
 import random
 import re
 import glob
+import time
+from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Multi‑account secret ────────────────────────────────────────────────────
+# ── Multi-account secret ─────────────────────────────────────────────────────
 ACCOUNTS_DATA = os.getenv("TMP_ACCOUNTS")
 if not ACCOUNTS_DATA:
     raise ValueError("TMP_ACCOUNTS must be set.\nFormat: phone:pass:tasks,phone:pass:tasks,...")
@@ -16,20 +18,94 @@ if not ACCOUNTS_DATA:
 TMP_LOGIN_URL   = "https://tmpjob.net/login"
 TASK_CENTER_URL = "https://tmpjob.net/index/rotary/index.html"
 
-# Stagger logins (seconds) – account 0 starts immediately, each next waits 5‑15 s extra.
 STAGGER_MIN = 5
 STAGGER_MAX = 15
 
+# ── Display constants ─────────────────────────────────────────────────────────
+W   = 68
+HDR = "=" * W
+DIV = "-" * W
+DOT = "." * W
+
+LVL = {
+    "INFO":  " INFO  ",
+    "OK":    "  OK   ",
+    "WAIT":  " WAIT  ",
+    "SKIP":  " SKIP  ",
+    "WARN":  " WARN  ",
+    "ERROR": " ERROR ",
+    "STEP":  " STEP  ",
+    "DONE":  " DONE  ",
+}
+
+_event_counter = 0
+
+def _ts():
+    return datetime.now().strftime("%H:%M:%S")
+
+def _next_n():
+    global _event_counter
+    _event_counter += 1
+    return _event_counter
+
+def _acct(phone):
+    return f"#{phone[-6:]}"
+
+def log(phone, level, msg, step=None):
+    n   = _next_n()
+    tag = LVL.get(level, " INFO  ")
+    acc = _acct(phone) if phone else "       "
+    sp  = f"[{step:02d}] " if step is not None else ""
+    print(f"{n:>4}  {_ts()}  {acc}  [{tag}]  {sp}{msg}", flush=True)
+
+def log_sys(msg, level="INFO"):
+    n   = _next_n()
+    tag = LVL.get(level, " INFO  ")
+    print(f"{n:>4}  {_ts()}  {'':>7}  [{tag}]  {msg}", flush=True)
+
+def rule(char="."):
+    print(char * W, flush=True)
+
+def header(title):
+    print(HDR, flush=True)
+    pad = (W - len(title) - 2) // 2
+    print(f"{'':>{pad}} {title} ", flush=True)
+    print(HDR, flush=True)
+
+def gh_group(title):
+    print(f"::group::{title}", flush=True)
+
+def gh_endgroup():
+    print("::endgroup::", flush=True)
+
+def gh_notice(msg):
+    print(f"::notice ::{msg}", flush=True)
+
+def gh_warning(msg):
+    print(f"::warning ::{msg}", flush=True)
+
+def gh_error(msg):
+    print(f"::error ::{msg}", flush=True)
+
+# ── Per-account result tracking ───────────────────────────────────────────────
+results = {}
+
 # ====================== STORAGE CLEANUP ======================
+def _safe_remove(f):
+    try:
+        os.remove(f)
+        return True
+    except:
+        return False
+
 def cleanup_old_screenshots():
-    for file in glob.glob("*.png"):
-        try:
-            os.remove(file)
-            print(f"🧹 Cleaned old screenshot: {file}")
-        except:
-            pass
-    print("✅ Storage cleanup completed")
-# ============================================================
+    files = glob.glob("*.png")
+    count = sum(_safe_remove(f) for f in files)
+    if count:
+        log_sys(f"Removed {count} old screenshot(s)", "INFO")
+    else:
+        log_sys("No old screenshots found", "INFO")
+# =============================================================
 
 async def safe_click(page, selectors, timeout=8000):
     if isinstance(selectors, str):
@@ -53,46 +129,44 @@ async def is_logged_in(page_or_frame):
     except:
         return False
 
-async def close_any_popup(main):
+async def close_any_popup(main, phone):
     for popup_selectors in [
         ["text=Gufunga", "button:has-text('Gufunga')"],
         ["button:has-text('X')", ".close", "[aria-label='Close']", ".modal-close"]
     ]:
         closed = await safe_click(main, popup_selectors, timeout=3000)
         if closed:
-            print("   🔒 Popup closed.")
-            break
-    else:
-        print("   ℹ️ No popup detected, proceeding.")
+            log(phone, "INFO", "Popup dismissed")
+            return
+    log(phone, "INFO", "No popup -- clear to proceed")
 
-# ──────────────────────────── PER‑ACCOUNT WORKER ────────────────────────────
+# ──────────────────────────── PER-ACCOUNT WORKER ────────────────────────────
 async def run_account_worker(phone, password, target_tasks, stagger_delay):
-    """
-    Exactly the same logic as the reliable single‑account bot,
-    but wrapped to be called concurrently with its own context.
-    """
-    tag = f"[{phone}]"
+    t0 = time.time()
+    results[phone] = {"done": 0, "target": target_tasks, "status": "waiting", "elapsed": 0.0}
 
-    # Stagger login
     if stagger_delay > 0:
-        print(f"{tag} ⏱️ Waiting {stagger_delay:.0f}s before login (stagger)…")
+        log(phone, "WAIT", f"Stagger delay  {stagger_delay:.0f}s")
         await asyncio.sleep(stagger_delay)
 
-    # ── Fresh isolated context ───────────────────────────────────────────
+    gh_group(f"{_acct(phone)}  target={target_tasks} tasks")
+    rule("=")
+    print(f"  ACCOUNT  {phone}  /  target: {target_tasks} tasks", flush=True)
+    rule("-")
+
     context = await browser.new_context(
         viewport={"width": 412, "height": 915},
         is_mobile=True,
-        user_agent="Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+        user_agent="Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
     )
     page = await context.new_page()
 
     try:
-        print(f"{tag} ───────────────────────────────────────")
-        print(f"{tag} Target: {target_tasks} tasks")
-        print(f"{tag} ───────────────────────────────────────")
+        # ── LOGIN ─────────────────────────────────────────────────────────────
+        results[phone]["status"] = "logging in"
+        log(phone, "INFO", "Opening login page")
 
-        # ── LOGIN ─────────────────────────────────────────────────────────
-        print(f"{tag} 🔐 Opening TMP login…")
         await page.goto(TMP_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
         main = page
 
@@ -105,66 +179,74 @@ async def run_account_worker(phone, password, target_tasks, stagger_delay):
         await main.locator("input").nth(0).fill(phone)
         await main.locator("input").nth(1).fill(password)
         await safe_click(main, ["button", ".login-button"])
-        print(f"{tag} 👆 Login submitted.")
+        log(phone, "WAIT", "Credentials submitted -- awaiting session")
 
-        print(f"{tag} ⏳ Waiting for successful login…")
         await asyncio.sleep(10)
         if not await is_logged_in(main):
             await asyncio.sleep(5)
             if not await is_logged_in(main):
-                print(f"{tag} ❌ LOGIN FAILED — Check password in secrets")
+                log(phone, "ERROR", "Login failed -- verify credentials in TMP_ACCOUNTS secret")
+                results[phone]["status"] = "login failed"
+                gh_error(f"{phone}: login failed")
                 await page.screenshot(path=f"login_failed_{phone}.png")
                 return
 
-        print(f"{tag} ✅ Login successful!")
-        await close_any_popup(main)
+        log(phone, "OK", "Session established")
+        results[phone]["status"] = "running"
+        await close_any_popup(main, phone)
 
-        # ── NAVIGATE TO TASK CENTER ───────────────────────────────────────
-        print(f"{tag} 🧭 Clicking 'Inshingano' nav item…")
-        nav_clicked = await safe_click(main, ["text=Inshingano", ".bottom-nav > a:nth-child(2)"], timeout=15000)
+        # ── NAVIGATE TO TASK CENTER ───────────────────────────────────────────
+        log(phone, "INFO", "Navigating to task center")
+        nav_clicked = await safe_click(
+            main, ["text=Inshingano", ".bottom-nav > a:nth-child(2)"], timeout=15000
+        )
         if not nav_clicked:
             await page.goto(TASK_CENTER_URL, wait_until="networkidle")
             await asyncio.sleep(5)
 
-        # Ensure we are in the right context (iframe or main)
         try:
             await main.wait_for_selector(":has-text('Iterambere ry\\'imirimo')", timeout=10000)
         except:
             try:
                 iframe_el = await page.wait_for_selector("iframe", timeout=8000)
                 main = await iframe_el.content_frame()
-                print("   🔄 Switched to iframe.")
+                log(phone, "INFO", "Context  ->  iframe")
             except:
                 pass
 
-        # ── PROGRESS CHECK ─────────────────────────────────────────────────
-        print(f"{tag} 📊 Checking progress…")
+        # ── PROGRESS CHECK ────────────────────────────────────────────────────
         progress_text = await main.inner_text("body")
         match = re.search(rf'(\d+)\s*/\s*{target_tasks}', progress_text)
         done = int(match.group(1)) if match else 0
-        print(f"{tag} 📊 Progress: {done}/{target_tasks}")
+        results[phone]["done"] = done
+
+        pct = int(done / target_tasks * 100) if target_tasks else 0
+        log(phone, "INFO", f"Progress check  {done}/{target_tasks}  ({pct}%)")
+        rule(".")
 
         if done >= target_tasks:
-            print(f"{tag} 🎉 All tasks already completed — skipping.")
+            log(phone, "SKIP", "All tasks already completed")
+            results[phone]["status"] = "already complete"
             return
 
-        # ── TASK LOOP ─────────────────────────────────────────────────────
+        # ── TASK LOOP ─────────────────────────────────────────────────────────
         for i in range(done + 1, target_tasks + 1):
-            print(f"\n{tag} 🚀 Task {i}/{target_tasks}")
+            log(phone, "STEP", f"Starting task  {i}/{target_tasks}", step=i)
 
-            # Re‑detect context before each task
             try:
                 await main.wait_for_selector("text=Shaka gahunda", timeout=5000)
             except:
                 try:
                     iframe_el = await page.wait_for_selector("iframe", timeout=8000)
                     main = await iframe_el.content_frame()
-                    print("   🔄 Re‑switched to iframe.")
+                    log(phone, "INFO", "Re-entered iframe context", step=i)
                 except:
                     main = page
 
-            if not await safe_click(main, ["text=Shaka gahunda", 'button:has-text("Shaka gahunda")'], timeout=20000):
-                print(f"{tag} ⚠️ Shaka gahunda not found. Reloading Task Center…")
+            if not await safe_click(
+                main, ["text=Shaka gahunda", 'button:has-text("Shaka gahunda")'], timeout=20000
+            ):
+                log(phone, "WARN", "Shaka gahunda not found -- reloading task center", step=i)
                 await page.goto(TASK_CENTER_URL, wait_until="domcontentloaded")
                 await asyncio.sleep(4)
                 continue
@@ -173,32 +255,41 @@ async def run_account_worker(phone, password, target_tasks, stagger_delay):
             await safe_click(main, ["text=Nibyo", "button:has-text('Nibyo')"], timeout=7000)
             await asyncio.sleep(2)
 
-            if not await safe_click(main, ["text=Tanga icyifuzo", "text=Tanga inshingano", ".button-fill"], timeout=15000):
-                print(f"{tag} ❌ Could not find submit button. Skipping task.")
+            if not await safe_click(
+                main, ["text=Tanga icyifuzo", "text=Tanga inshingano", ".button-fill"], timeout=15000
+            ):
+                log(phone, "WARN", "Submit button not found -- skipping task", step=i)
                 continue
 
-            print(f"{tag} ⏳ Waiting for 100%…")
+            log(phone, "WAIT", "Waiting for 100% completion signal", step=i)
             success_100 = False
             for attempt in range(5):
                 try:
-                    await main.wait_for_function("() => document.body.innerText.includes('100%')", timeout=25000)
+                    await main.wait_for_function(
+                        "() => document.body.innerText.includes('100%')", timeout=25000
+                    )
                     success_100 = True
                     break
                 except:
-                    print(f"...waiting (attempt {attempt+1})…")
+                    log(phone, "WAIT", f"Not yet complete  (attempt {attempt + 1}/5)", step=i)
                     await asyncio.sleep(4)
 
             if not success_100:
-                print(f"{tag} ⚠️ 100% not reached. Moving on.")
+                log(phone, "WARN", "100% not reached -- moving to next task", step=i)
                 await page.goto(TASK_CENTER_URL, wait_until="domcontentloaded")
                 continue
 
             await asyncio.sleep(2)
             await safe_click(main, ["text=Tanga inshingano", ".button-fill"], timeout=10000)
-            print(f"{tag} ✅ Task {i} completed.")
 
-            print(f"{tag} 🔁 Returning to Task Center…")
-            clicked_nav = await safe_click(page, ["text=Inshingano", ".bottom-nav > a:nth-child(2)"], timeout=8000)
+            done = i
+            results[phone]["done"] = done
+            pct = int(done / target_tasks * 100)
+            log(phone, "OK", f"Task complete  {done}/{target_tasks}  ({pct}%)", step=i)
+
+            clicked_nav = await safe_click(
+                page, ["text=Inshingano", ".bottom-nav > a:nth-child(2)"], timeout=8000
+            )
             if not clicked_nav:
                 await page.goto(TASK_CENTER_URL, wait_until="domcontentloaded")
                 await asyncio.sleep(4)
@@ -212,20 +303,109 @@ async def run_account_worker(phone, password, target_tasks, stagger_delay):
                 except:
                     pass
 
-        print(f"{tag} 🏁 All tasks done!")
+        results[phone]["status"] = "complete"
+        rule(".")
+        log(phone, "DONE", f"All {target_tasks} tasks finished")
+        gh_notice(f"{phone}: {target_tasks}/{target_tasks} complete")
 
     except Exception as e:
-        print(f"{tag} ❌ Error: {e}")
+        results[phone]["status"] = "error"
+        log(phone, "ERROR", f"{e}")
+        gh_error(f"{phone}: {e}")
         await page.screenshot(path=f"error_{phone}.png")
     finally:
+        results[phone]["elapsed"] = time.time() - t0
         await context.close()
+        rule("=")
+        gh_endgroup()
 
 
-# ──────────────────────────── MAIN ────────────────────────────
+# ──────────────────────────── REPORT CARD ────────────────────────────────────
+def print_report(wall_secs):
+    print("", flush=True)
+    print(HDR, flush=True)
+    print(f"  RUN REPORT  //  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(HDR, flush=True)
+
+    col_w = [13, 7, 7, 7, 11, 10]
+    cols  = ["ACCOUNT", "TARGET", "DONE", "LEFT", "STATUS", "ELAPSED"]
+    hdr   = "  ".join(c.ljust(col_w[i]) for i, c in enumerate(cols))
+    print(f"  {hdr}", flush=True)
+    print(DIV, flush=True)
+
+    total_done   = 0
+    total_target = 0
+    all_ok       = True
+
+    for phone, r in results.items():
+        done   = r["done"]
+        target = r["target"]
+        status = r["status"]
+        secs   = r["elapsed"]
+        left   = target - done
+
+        total_done   += done
+        total_target += target
+
+        mins  = int(secs // 60)
+        sec   = int(secs % 60)
+        t_str = f"{mins}m {sec:02d}s"
+
+        if status in ("login failed", "error"):
+            all_ok = False
+            s_str  = "FAILED"
+        elif status in ("complete", "already complete"):
+            s_str = "COMPLETE"
+        else:
+            s_str = status.upper()
+            all_ok = False
+
+        row    = [phone[-12:], str(target), str(done), str(left), s_str, t_str]
+        line   = "  ".join(v.ljust(col_w[i]) for i, v in enumerate(row))
+        marker = ">>>" if s_str == "FAILED" else "   "
+        print(f"{marker} {line}", flush=True)
+
+    print(DIV, flush=True)
+
+    pct       = int(total_done / total_target * 100) if total_target else 0
+    wall_mins = int(wall_secs // 60)
+    wall_sec  = int(wall_secs % 60)
+
+    totals = [
+        "TOTAL".ljust(col_w[0]),
+        str(total_target).ljust(col_w[1]),
+        str(total_done).ljust(col_w[2]),
+        str(total_target - total_done).ljust(col_w[3]),
+        (str(pct) + "%").ljust(col_w[4]),
+        (f"{wall_mins}m {wall_sec:02d}s").ljust(col_w[5]),
+    ]
+    print(f"    {'  '.join(totals)}", flush=True)
+    print(HDR, flush=True)
+
+    outcome = "ALL ACCOUNTS COMPLETE" if all_ok else "SOME ACCOUNTS FAILED -- SEE >>> ROWS ABOVE"
+    print(f"  {outcome}", flush=True)
+    print(HDR, flush=True)
+    print("", flush=True)
+
+    if all_ok:
+        gh_notice(f"Run complete -- {total_done}/{total_target} tasks across {len(results)} accounts")
+    else:
+        failed = [p for p, r in results.items() if r["status"] in ("login failed", "error")]
+        gh_warning(f"Failed accounts: {', '.join(failed)}")
+
+
+# ──────────────────────────── MAIN ───────────────────────────────────────────
 async def main():
-    cleanup_old_screenshots()
+    t_start = time.time()
 
-    # Parse TMP_ACCOUNTS: "phone:pass:tasks,phone:pass:tasks,..."
+    print("", flush=True)
+    header(f"TMP BOT  //  {datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}")
+    print("", flush=True)
+
+    cleanup_old_screenshots()
+    rule(".")
+
+    # ── Parse accounts ────────────────────────────────────────────────────────
     accounts = []
     for entry in ACCOUNTS_DATA.split(","):
         parts = entry.strip().split(":")
@@ -233,16 +413,29 @@ async def main():
             try:
                 accounts.append((parts[0], parts[1], int(parts[2])))
             except ValueError:
-                print(f"⚠️ Bad task count in {entry!r} — skipping.")
+                log_sys(f"Bad task count in {entry!r} -- skipping", "WARN")
         else:
-            print(f"⚠️ Malformed entry {entry!r} — expected phone:pass:tasks — skipping.")
+            log_sys(f"Malformed entry {entry!r} -- expected phone:pass:tasks", "WARN")
 
     if not accounts:
-        print("❌ No valid accounts. Exiting.")
+        log_sys("No valid accounts found. Exiting.", "ERROR")
         return
 
-    print(f"📋 {len(accounts)} account(s) loaded.")
-    print(f"⚡ All accounts will run IN PARALLEL with staggered logins.\n")
+    log_sys(f"{len(accounts)} account(s) loaded  /  parallel  /  staggered logins")
+    rule(".")
+    print(f"  {'#':>4}  {'ACCOUNT':>13}  {'TASKS':>5}  {'START':>8}", flush=True)
+    print(f"  {DIV[:40]}", flush=True)
+
+    coros       = []
+    cumul_delay = 0.0
+    for idx, (phone, password, target) in enumerate(accounts, 1):
+        d_str = "now" if cumul_delay == 0 else f"+{cumul_delay:.0f}s"
+        print(f"  {idx:>4}  {phone:>13}  {target:>5}  {d_str:>8}", flush=True)
+        coros.append(run_account_worker(phone, password, target, cumul_delay))
+        cumul_delay += random.uniform(STAGGER_MIN, STAGGER_MAX)
+
+    rule(".")
+    print("", flush=True)
 
     global browser
     async with async_playwright() as p:
@@ -250,22 +443,10 @@ async def main():
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
-
-        # Build coroutines with cumulative stagger delay
-        coros = []
-        cumulative_delay = 0.0
-        for phone, password, target in accounts:
-            coros.append(run_account_worker(phone, password, target, cumulative_delay))
-            cumulative_delay += random.uniform(STAGGER_MIN, STAGGER_MAX)
-
-        # Run all concurrently – one account crash doesn't stop the others
         await asyncio.gather(*coros, return_exceptions=True)
-
         await browser.close()
 
-    print(f"\n{'═'*55}")
-    print("🏁 All accounts finished!")
-    print(f"{'═'*55}")
+    print_report(time.time() - t_start)
 
 
 if __name__ == "__main__":
